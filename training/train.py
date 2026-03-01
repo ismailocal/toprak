@@ -12,10 +12,15 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 
-from model.config import ModelConfig, TOPRAK_SMALL, TOPRAK_MEDIUM
+from model.config import ModelConfig, CONFIGS, detect_device
 from model.transformer import ToprakLM
 from model.tokenizer import ToprakTokenizer
 from data.dataset import ToprakDataset, create_dataloader
+from utils.validation import (
+    validate_tokenizer, validate_dir_has_data,
+    validate_checkpoint, validate_dataset_size,
+    setup_error_handler, ToprakError,
+)
 from training.trainer import ToprakTrainer
 
 
@@ -27,14 +32,14 @@ def parse_args():
     # Model
     parser.add_argument(
         "--model-size", type=str, default="small",
-        choices=["small", "medium"],
-        help="Model boyutu: small (85M) veya medium (125M)"
+        choices=["small", "medium", "large", "xl"],
+        help="Model boyutu: small (~80M), medium (~125M), large (~342M), xl (~941M)"
     )
 
     # Veri
     parser.add_argument(
-        "--data-dir", type=str, default="data_cache/clean",
-        help="Eğitim verisi dizini"
+        "--data-dir", type=str, default="data_cache/clean/train",
+        help="Eğitim verisi dizini (varsayılan: data_cache/clean/train)"
     )
     parser.add_argument(
         "--eval-data-dir", type=str, default=None,
@@ -67,13 +72,28 @@ def parse_args():
     parser.add_argument(
         "--device", type=str, default=None,
         choices=["mps", "cpu", "cuda"],
-        help="Eğitim cihazı"
+        help="Eğitim cihazı (varsayılan: otomatik algılama)"
+    )
+
+    # Optimizasyonlar
+    parser.add_argument(
+        "--no-compile", action="store_true",
+        help="torch.compile() devre dışı bırak"
+    )
+    parser.add_argument(
+        "--no-grad-checkpoint", action="store_true",
+        help="Gradient checkpointing devre dışı bırak"
+    )
+    parser.add_argument(
+        "--log-dir", type=str, default="logs",
+        help="TensorBoard log dizini"
     )
 
     return parser.parse_args()
 
 
 def main():
+    setup_error_handler()
     args = parse_args()
 
     print("🌱 Toprak — Türkçe Dil Modeli")
@@ -82,10 +102,7 @@ def main():
     # ─────────────────────────────────────────────
     # 1. Konfigürasyon
     # ─────────────────────────────────────────────
-    if args.model_size == "small":
-        config = TOPRAK_SMALL
-    else:
-        config = TOPRAK_MEDIUM
+    config = CONFIGS[args.model_size]
 
     # CLI argümanları ile override
     if args.batch_size:
@@ -102,29 +119,41 @@ def main():
         config.save_every = args.save_every
     if args.device:
         config.device = args.device
+    else:
+        config.device = detect_device()
 
-    # MPS kontrolü
+    # Cihaz kontrolü
     if config.device == "mps" and not torch.backends.mps.is_available():
         print("⚠ MPS kullanılamıyor, CPU'ya geçiliyor...")
         config.device = "cpu"
+    elif config.device == "cuda" and not torch.cuda.is_available():
+        print("⚠ CUDA kullanılamıyor, CPU'ya geçiliyor...")
+        config.device = "cpu"
+
+    if config.device == "cuda":
+        gpu_name = torch.cuda.get_device_name(0)
+        gpu_mem = torch.cuda.get_device_properties(0).total_mem / 1e9
+        print(f"\n🚀 GPU: {gpu_name} ({gpu_mem:.0f} GB)")
 
     print(f"\n📋 Konfigürasyon:")
-    print(f"  Model:     Toprak {args.model_size} ({config.d_model}d, {config.num_layers}L)")
+    print(f"  Model:     Toprak {args.model_size.upper()} ({config.d_model}d, {config.num_layers}L, {config.num_heads}H/{config.num_kv_heads}KV)")
     print(f"  Vocab:     {config.vocab_size:,}")
     print(f"  Max Seq:   {config.max_seq_len}")
     print(f"  Device:    {config.device}")
 
     # ─────────────────────────────────────────────
-    # 2. Tokenizer
+    # 2. Tokenizer — dosya kontrolü
     # ─────────────────────────────────────────────
+    validate_tokenizer(args.tokenizer)
     print(f"\n📝 Tokenizer yükleniyor: {args.tokenizer}")
     tokenizer = ToprakTokenizer(args.tokenizer)
     config.vocab_size = tokenizer.get_vocab_size()
     print(f"  Vocab size: {config.vocab_size:,}")
 
     # ─────────────────────────────────────────────
-    # 3. Dataset
+    # 3. Dataset — veri kontrolü
     # ─────────────────────────────────────────────
+    validate_dir_has_data(args.data_dir, description="Eğitim verisi dizini")
     print(f"\n📦 Veri yükleniyor: {args.data_dir}")
     train_dataset = ToprakDataset(
         data_dir=args.data_dir,
@@ -132,6 +161,8 @@ def main():
         max_seq_len=config.max_seq_len,
         split="train",
     )
+    validate_dataset_size(train_dataset, min_blocks=1, description="Eğitim verisi")
+
     train_loader = create_dataloader(
         train_dataset,
         batch_size=config.batch_size,
@@ -140,11 +171,13 @@ def main():
 
     eval_loader = None
     if args.eval_data_dir:
+        validate_dir_has_data(args.eval_data_dir, description="Eval verisi dizini")
         eval_dataset = ToprakDataset(
             data_dir=args.eval_data_dir,
             tokenizer=tokenizer,
             max_seq_len=config.max_seq_len,
             split="eval",
+            shuffle_docs=False,
         )
         eval_loader = create_dataloader(
             eval_dataset,
@@ -153,14 +186,20 @@ def main():
         )
 
     # ─────────────────────────────────────────────
-    # 4. Model
+    # 4. Resume checkpoint kontrolü
+    # ─────────────────────────────────────────────
+    if args.resume:
+        validate_checkpoint(args.resume)
+
+    # ─────────────────────────────────────────────
+    # 5. Model
     # ─────────────────────────────────────────────
     model = ToprakLM(config)
     param_count = model.count_parameters()
     print(f"\n🧠 Model oluşturuldu: {param_count/1e6:.1f}M parametre")
 
     # ─────────────────────────────────────────────
-    # 5. Eğitim
+    # 6. Eğitim
     # ─────────────────────────────────────────────
     trainer = ToprakTrainer(
         model=model,
@@ -168,6 +207,9 @@ def main():
         train_dataloader=train_loader,
         eval_dataloader=eval_loader,
         checkpoint_dir=args.checkpoint_dir,
+        use_compile=not args.no_compile,
+        use_gradient_checkpointing=not args.no_grad_checkpoint,
+        log_dir=args.log_dir,
     )
 
     trainer.train(resume_from=args.resume)

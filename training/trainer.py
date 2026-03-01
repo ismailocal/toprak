@@ -1,6 +1,12 @@
 """
 Toprak — Trainer Sınıfı
-Eğitim döngüsü, checkpoint yönetimi ve logging.
+Eğitim döngüsü, checkpoint yönetimi, TensorBoard logging.
+
+Optimizasyonlar:
+- torch.compile() ile model derleme
+- Gradient checkpointing (bellek tasarrufu)
+- TensorBoard ile eğitim metrikleri
+- bfloat16 mixed precision (MPS)
 """
 
 import os
@@ -16,6 +22,13 @@ from model.config import ModelConfig
 from model.transformer import ToprakLM
 from training.scheduler import CosineWarmupScheduler
 
+# TensorBoard — opsiyonel
+try:
+    from torch.utils.tensorboard import SummaryWriter
+    HAS_TENSORBOARD = True
+except ImportError:
+    HAS_TENSORBOARD = False
+
 
 class ToprakTrainer:
     """
@@ -24,9 +37,11 @@ class ToprakTrainer:
     Özellikler:
     - Apple M4 Pro MPS optimizasyonu
     - bfloat16 mixed precision
+    - torch.compile() ile model derleme
+    - Gradient checkpointing (bellek tasarrufu)
     - Gradient accumulation
     - Checkpoint save/resume
-    - Detaylı logging
+    - TensorBoard logging
     """
 
     def __init__(
@@ -36,6 +51,9 @@ class ToprakTrainer:
         train_dataloader,
         eval_dataloader=None,
         checkpoint_dir: str = "checkpoints",
+        use_compile: bool = True,
+        use_gradient_checkpointing: bool = True,
+        log_dir: str = "logs",
     ):
         self.model = model
         self.config = config
@@ -44,6 +62,31 @@ class ToprakTrainer:
         self.checkpoint_dir = checkpoint_dir
 
         os.makedirs(checkpoint_dir, exist_ok=True)
+
+        # ─── Gradient Checkpointing ───
+        if use_gradient_checkpointing:
+            self.model.gradient_checkpointing = True
+            print("  ✓ Gradient checkpointing aktif (bellek tasarrufu)")
+
+        # ─── torch.compile() ───
+        self.compiled = False
+        if use_compile:
+            try:
+                self.model = torch.compile(self.model)
+                self.compiled = True
+                print("  ✓ torch.compile() aktif (eğitim hızlandırma)")
+            except Exception as e:
+                print(f"  ⚠ torch.compile() başarısız: {e}")
+
+        # ─── TensorBoard ───
+        self.writer = None
+        if HAS_TENSORBOARD:
+            os.makedirs(log_dir, exist_ok=True)
+            self.writer = SummaryWriter(log_dir=log_dir)
+            print(f"  ✓ TensorBoard aktif → {log_dir}/")
+            print(f"    Görüntüle: tensorboard --logdir {log_dir}")
+        else:
+            print("  ⚠ TensorBoard bulunamadı (pip install tensorboard)")
 
         # Optimizer: AdamW with weight decay
         self.optimizer = AdamW(
@@ -95,10 +138,19 @@ class ToprakTrainer:
         print(f"  Learning Rate:       {self.config.learning_rate}")
         print(f"  Max Steps:           {self.config.max_steps}")
         print(f"  Warmup Steps:        {self.config.warmup_steps}")
+        print(f"  torch.compile:       {'✅' if self.compiled else '❌'}")
+        print(f"  Grad Checkpoint:     {'✅' if hasattr(self.model, 'gradient_checkpointing') and self.model.gradient_checkpointing else '❌'}")
+        print(f"  TensorBoard:         {'✅' if self.writer else '❌'}")
+        if self.writer:
+            print(f"")
+            print(f"  📊 Eğitim loglarını takip etmek için yeni bir terminalde:")
+            print(f"     tensorboard --logdir {self.writer.log_dir}")
+            print(f"     Tarayıcıda: http://localhost:6006")
         print(f"{'='*60}\n")
 
         accumulation_loss = 0.0
         start_time = time.time()
+        step_start_time = time.time()
         tokens_processed = 0
 
         data_iter = iter(self.train_dataloader)
@@ -117,13 +169,14 @@ class ToprakTrainer:
                 input_ids = batch["input_ids"].to(self.device)
                 labels = batch["labels"].to(self.device)
 
-                # Mixed precision forward pass
-                if self.device == "mps":
-                    # MPS için autocast
-                    with torch.autocast(device_type="mps", dtype=torch.bfloat16):
-                        logits, loss = self.model(input_ids, targets=labels)
+                # Mixed precision forward pass — MPS (bfloat16) / CUDA (float16)
+                if self.device in ("mps", "cpu"):
+                    with torch.autocast(device_type=self.device, dtype=torch.bfloat16, enabled=(self.device == "mps")):
+                        logits, loss, _ = self.model(input_ids, targets=labels)
                 else:
-                    logits, loss = self.model(input_ids, targets=labels)
+                    # CUDA — float16 with GradScaler
+                    with torch.autocast(device_type="cuda", dtype=torch.float16):
+                        logits, loss, _ = self.model(input_ids, targets=labels)
 
                 # Gradient accumulation: loss'u böl
                 loss = loss / self.config.grad_accum_steps
@@ -132,7 +185,7 @@ class ToprakTrainer:
                 tokens_processed += input_ids.numel()
 
             # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(
+            grad_norm = torch.nn.utils.clip_grad_norm_(
                 self.model.parameters(), self.config.gradient_clip
             )
 
@@ -141,10 +194,12 @@ class ToprakTrainer:
             lr = self.scheduler.step()
             self.global_step += 1
 
-            # Logging
+            # Logging (her 100 adımda)
             if self.global_step % 100 == 0:
                 elapsed = time.time() - start_time
+                step_time = time.time() - step_start_time
                 tokens_per_sec = tokens_processed / elapsed
+
                 print(
                     f"  Step {self.global_step:>6d}/{self.config.max_steps} | "
                     f"Loss: {accumulation_loss:.4f} | "
@@ -153,6 +208,16 @@ class ToprakTrainer:
                     f"Elapsed: {elapsed/60:.1f}min"
                 )
                 self.train_losses.append((self.global_step, accumulation_loss))
+
+                # TensorBoard logging
+                if self.writer:
+                    self.writer.add_scalar("train/loss", accumulation_loss, self.global_step)
+                    self.writer.add_scalar("train/learning_rate", lr, self.global_step)
+                    self.writer.add_scalar("train/tokens_per_sec", tokens_per_sec, self.global_step)
+                    self.writer.add_scalar("train/grad_norm", grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm, self.global_step)
+                    self.writer.add_scalar("train/epoch_time_min", elapsed / 60, self.global_step)
+
+                step_start_time = time.time()
 
             accumulation_loss = 0.0
 
@@ -164,6 +229,12 @@ class ToprakTrainer:
                 if self.eval_dataloader:
                     eval_loss = self.evaluate()
                     print(f"  📊 Eval Loss: {eval_loss:.4f}")
+
+                    if self.writer:
+                        self.writer.add_scalar("eval/loss", eval_loss, self.global_step)
+                        import math
+                        self.writer.add_scalar("eval/perplexity", math.exp(eval_loss), self.global_step)
+
                     if eval_loss < self.best_eval_loss:
                         self.best_eval_loss = eval_loss
                         self.save_checkpoint(tag="best")
@@ -178,6 +249,9 @@ class ToprakTrainer:
         print(f"  En iyi eval loss: {self.best_eval_loss:.4f}")
         print(f"{'='*60}")
 
+        if self.writer:
+            self.writer.close()
+
     @torch.no_grad()
     def evaluate(self) -> float:
         """Eval seti üzerinde loss hesapla."""
@@ -189,7 +263,7 @@ class ToprakTrainer:
             input_ids = batch["input_ids"].to(self.device)
             labels = batch["labels"].to(self.device)
 
-            _, loss = self.model(input_ids, targets=labels)
+            _, loss, _ = self.model(input_ids, targets=labels)
             total_loss += loss.item()
             num_batches += 1
 
@@ -207,8 +281,13 @@ class ToprakTrainer:
 
         filepath = os.path.join(self.checkpoint_dir, filename)
 
+        # torch.compile model'den orijinal state_dict çıkar
+        model_to_save = self.model
+        if hasattr(self.model, '_orig_mod'):
+            model_to_save = self.model._orig_mod
+
         checkpoint = {
-            "model_state_dict": self.model.state_dict(),
+            "model_state_dict": model_to_save.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scheduler_state_dict": self.scheduler.state_dict(),
             "global_step": self.global_step,
@@ -217,9 +296,12 @@ class ToprakTrainer:
                 "vocab_size": self.config.vocab_size,
                 "d_model": self.config.d_model,
                 "num_heads": self.config.num_heads,
+                "num_kv_heads": self.config.num_kv_heads,
                 "num_layers": self.config.num_layers,
                 "d_ff": self.config.d_ff,
                 "max_seq_len": self.config.max_seq_len,
+                "rope_theta": self.config.rope_theta,
+                "norm_eps": self.config.norm_eps,
             },
         }
 
@@ -233,7 +315,12 @@ class ToprakTrainer:
         """Checkpoint'ten devam et."""
         checkpoint = torch.load(filepath, map_location=self.device, weights_only=False)
 
-        self.model.load_state_dict(checkpoint["model_state_dict"])
+        # torch.compile model'e yükleme
+        model_to_load = self.model
+        if hasattr(self.model, '_orig_mod'):
+            model_to_load = self.model._orig_mod
+
+        model_to_load.load_state_dict(checkpoint["model_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 
         # Optimizer state'lerini doğru device'a taşı (CPU → MPS fix)

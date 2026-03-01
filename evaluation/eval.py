@@ -12,10 +12,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 from tqdm import tqdm
 
-from model.config import ModelConfig, TOPRAK_SMALL
+from model.config import ModelConfig, TOPRAK_SMALL, detect_device
 from model.transformer import ToprakLM
 from model.tokenizer import ToprakTokenizer
 from data.dataset import ToprakDataset, create_dataloader
+from utils.validation import (
+    validate_checkpoint, validate_tokenizer,
+    validate_dir_has_data, setup_error_handler,
+)
 
 
 @torch.no_grad()
@@ -52,7 +56,7 @@ def compute_perplexity(
         input_ids = batch["input_ids"].to(device)
         labels = batch["labels"].to(device)
 
-        logits, loss = model(input_ids, targets=labels)
+        logits, loss, _ = model(input_ids, targets=labels)
 
         # Pad tokenlerini sayma
         non_pad = (labels != 0).sum().item()
@@ -137,13 +141,25 @@ def evaluate_model(
 
 
 if __name__ == "__main__":
+    setup_error_handler()
     import argparse
 
     parser = argparse.ArgumentParser(description="Toprak — Model Değerlendirmesi")
-    parser.add_argument("--checkpoint", type=str, required=True)
-    parser.add_argument("--eval-data", type=str, required=True)
-    parser.add_argument("--tokenizer", type=str, default="toprak_tokenizer.model")
-    parser.add_argument("--device", type=str, default="mps")
+    parser.add_argument("--checkpoint", type=str, required=True,
+                        help="Model checkpoint dosyası")
+    parser.add_argument("--eval-data", type=str, required=True,
+                        help="Eval verisi dizini")
+    parser.add_argument("--tokenizer", type=str, default="toprak_tokenizer.model",
+                        help="Tokenizer model dosyası")
+    parser.add_argument("--device", type=str, default=None,
+                        help="Cihaz (varsayılan: otomatik)")
 
     args = parser.parse_args()
-    evaluate_model(args.checkpoint, args.eval_data, args.tokenizer, device=args.device)
+
+    # Dosya kontrolleri
+    validate_checkpoint(args.checkpoint)
+    validate_tokenizer(args.tokenizer)
+    validate_dir_has_data(args.eval_data, description="Eval verisi dizini")
+
+    device = args.device or detect_device()
+    evaluate_model(args.checkpoint, args.eval_data, args.tokenizer, device=device)

@@ -1,122 +1,188 @@
 """
 Toprak — Transformer Mimarisi
-Decoder-only Transformer, sıfırdan Türkçe dil modeli
+Decoder-only Transformer, sıfırdan Türkçe dil modeli.
+
+Modern mimari (2024):
+- RMSNorm (LayerNorm yerine)
+- SwiGLU aktivasyon (GELU yerine)
+- RoPE (learned positional embedding yerine)
+- GQA (Grouped Query Attention)
+- KV Cache (inference hızlandırma)
+- Bias yok (tüm Linear katmanlarda)
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
-from model.attention import MultiHeadAttention
+from model.attention import GroupedQueryAttention
 from model.config import ModelConfig
+from model.norms import RMSNorm
+from model.rope import precompute_freqs_cis
 
 
-class FeedForward(nn.Module):
-    """Position-wise Feed-Forward Network."""
+class SwiGLUFeedForward(nn.Module):
+    """
+    SwiGLU Feed-Forward Network.
+
+    Standart FFN: Linear → GELU → Linear
+    SwiGLU FFN:   SiLU(gate(x)) * up(x) → down
+
+    3 Linear katman, bias yok.
+    Referans: https://arxiv.org/abs/2002.05202
+    """
 
     def __init__(self, config: ModelConfig):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(config.d_model, config.d_ff),
-            nn.GELU(),
-            nn.Linear(config.d_ff, config.d_model),
-            nn.Dropout(config.dropout),
-        )
+        self.gate_proj = nn.Linear(config.d_model, config.d_ff, bias=False)
+        self.up_proj = nn.Linear(config.d_model, config.d_ff, bias=False)
+        self.down_proj = nn.Linear(config.d_ff, config.d_model, bias=False)
 
     def forward(self, x):
-        return self.net(x)
+        # SwiGLU: SiLU(gate) * up → down
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
 class TransformerBlock(nn.Module):
-    """Pre-LayerNorm Transformer bloğu."""
+    """
+    Pre-RMSNorm Transformer bloğu.
+
+    RMSNorm → GQA (+ RoPE, KV Cache) → Residual
+    RMSNorm → SwiGLU FFN → Residual
+    """
 
     def __init__(self, config: ModelConfig):
         super().__init__()
-        self.ln1 = nn.LayerNorm(config.d_model)
-        self.attn = MultiHeadAttention(config)
-        self.ln2 = nn.LayerNorm(config.d_model)
-        self.ffn = FeedForward(config)
+        self.ln1 = RMSNorm(config.d_model, eps=config.norm_eps)
+        self.attn = GroupedQueryAttention(config)
+        self.ln2 = RMSNorm(config.d_model, eps=config.norm_eps)
+        self.ffn = SwiGLUFeedForward(config)
 
-    def forward(self, x):
-        # Pre-LN: LayerNorm → Attention → Residual
-        x = x + self.attn(self.ln1(x))
-        # Pre-LN: LayerNorm → FFN → Residual
-        x = x + self.ffn(self.ln2(x))
-        return x
+    def forward(self, x, freqs_cis, past_kv=None, use_checkpoint=False):
+        """
+        Args:
+            x: (B, T, d_model)
+            freqs_cis: RoPE frekansları
+            past_kv: KV cache (opsiyonel)
+            use_checkpoint: Gradient checkpointing kullan (eğitimde bellek tasarrufu)
+
+        Returns:
+            x: (B, T, d_model)
+            present_kv: güncel KV cache
+        """
+        # Pre-RMSNorm → Attention → Residual
+        attn_out, present_kv = self.attn(self.ln1(x), freqs_cis, past_kv)
+        x = x + attn_out
+
+        # Pre-RMSNorm → SwiGLU FFN → Residual (gradient checkpointing opsiyonel)
+        if use_checkpoint and self.training:
+            x = x + grad_checkpoint(self.ffn, self.ln2(x), use_reentrant=False)
+        else:
+            x = x + self.ffn(self.ln2(x))
+
+        return x, present_kv
 
 
 class ToprakLM(nn.Module):
     """
     Toprak — Sıfırdan Türkçe Dil Modeli
 
-    Decoder-only Transformer mimarisi.
-    Token embedding + Positional embedding → N × TransformerBlock → LM Head
-    Weight tying: token embedding ağırlıkları LM head ile paylaşılır.
+    Modern decoder-only Transformer mimarisi:
+    Token Embedding → N × TransformerBlock → RMSNorm → LM Head
+
+    Özellikler:
+    - RMSNorm (bias'sız, hızlı normalizasyon)
+    - SwiGLU (gated FFN, SiLU aktivasyon)
+    - RoPE (rotary position embedding, learned positional yerine)
+    - GQA (grouped query attention, daha az KV head)
+    - KV Cache (inference'da 5-10x hız artışı)
+    - Weight Tying (embedding ↔ LM head)
     """
 
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
+        self.gradient_checkpointing = False  # Eğitim sırasında etkinleştirilebilir
 
-        # Embedding katmanları
+        # Token embedding (positional embedding yok — RoPE kullanılıyor)
         self.tok_emb = nn.Embedding(config.vocab_size, config.d_model)
-        self.pos_emb = nn.Embedding(config.max_seq_len, config.d_model)
-        self.emb_dropout = nn.Dropout(config.dropout)
 
         # Transformer blokları
         self.blocks = nn.ModuleList([
             TransformerBlock(config) for _ in range(config.num_layers)
         ])
 
-        # Son layer norm
-        self.ln_f = nn.LayerNorm(config.d_model)
+        # Son RMSNorm
+        self.ln_f = RMSNorm(config.d_model, eps=config.norm_eps)
 
-        # Language model head
+        # Language model head — bias yok
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
 
         # Weight tying — embedding ve lm_head aynı ağırlıkları paylaşır
         self.tok_emb.weight = self.lm_head.weight
 
+        # RoPE frekanslarını önceden hesapla ve buffer olarak kaydet
+        freqs_cis = precompute_freqs_cis(
+            dim=config.head_dim,
+            max_seq_len=config.max_seq_len * 2,  # Güvenlik payı
+            theta=config.rope_theta,
+        )
+        self.register_buffer("freqs_cis", freqs_cis, persistent=False)
+
         # Ağırlıkları başlat
         self.apply(self._init_weights)
 
+        # Residual projeksiyonlar için özel init (GPT-NeoX tarzı)
+        for name, p in self.named_parameters():
+            if name.endswith("out_proj.weight") or name.endswith("down_proj.weight"):
+                torch.nn.init.normal_(p, mean=0.0, std=0.02 / (2 * config.num_layers) ** 0.5)
+
     def _init_weights(self, module):
-        """Xavier/He benzeri ağırlık başlatma."""
+        """Ağırlık başlatma."""
         if isinstance(module, nn.Linear):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-        elif isinstance(module, nn.LayerNorm):
-            torch.nn.init.ones_(module.weight)
-            torch.nn.init.zeros_(module.bias)
 
-    def forward(self, input_ids, targets=None):
+    def forward(self, input_ids, targets=None, past_kvs=None):
         """
         Args:
             input_ids: (batch_size, seq_len) — token ID'leri
             targets: (batch_size, seq_len) — hedef token ID'leri (opsiyonel)
+            past_kvs: list of (k, v) tuples — KV cache (opsiyonel)
 
         Returns:
             logits: (batch_size, seq_len, vocab_size)
             loss: scalar (eğer targets verilmişse)
+            present_kvs: list of (k, v) — güncel KV cache
         """
         B, T = input_ids.shape
-        assert T <= self.config.max_seq_len, \
-            f"Sequence uzunluğu ({T}) max_seq_len'i ({self.config.max_seq_len}) aşıyor"
 
-        # Token + Position embeddings
-        positions = torch.arange(0, T, device=input_ids.device).unsqueeze(0)  # (1, T)
-        tok_emb = self.tok_emb(input_ids)        # (B, T, d_model)
-        pos_emb = self.pos_emb(positions)         # (1, T, d_model)
-        x = self.emb_dropout(tok_emb + pos_emb)  # (B, T, d_model)
+        # Token embedding (RoPE sayesinde positional embedding yok)
+        x = self.tok_emb(input_ids)  # (B, T, d_model)
+
+        # RoPE frekansları — mevcut pozisyon offset'ini hesapla
+        if past_kvs is not None and past_kvs[0] is not None:
+            past_len = past_kvs[0][0].size(2)
+        else:
+            past_len = 0
+
+        freqs_cis = self.freqs_cis[past_len:past_len + T]
 
         # Transformer blokları
-        for block in self.blocks:
-            x = block(x)
+        present_kvs = []
+        for i, block in enumerate(self.blocks):
+            past_kv = past_kvs[i] if past_kvs is not None else None
+            x, present_kv = block(
+                x, freqs_cis, past_kv,
+                use_checkpoint=self.gradient_checkpointing,
+            )
+            present_kvs.append(present_kv)
 
-        # Son layer norm
+        # Son RMSNorm
         x = self.ln_f(x)
 
         # LM Head — logits
@@ -131,7 +197,7 @@ class ToprakLM(nn.Module):
                 ignore_index=self.config.pad_token_id,
             )
 
-        return logits, loss
+        return logits, loss, present_kvs
 
     def count_parameters(self) -> int:
         """Toplam eğitilebilir parametre sayısı."""
@@ -147,7 +213,10 @@ class ToprakLM(nn.Module):
         top_p=0.9,
     ):
         """
-        Autoregressive metin üretimi.
+        KV Cache destekli autoregressive metin üretimi.
+
+        İlk adımda tüm prompt işlenir (prefill),
+        sonraki adımlarda sadece son token işlenir (decode).
 
         Args:
             input_ids: (1, seq_len) — başlangıç token'ları
@@ -157,13 +226,18 @@ class ToprakLM(nn.Module):
             top_p: nucleus sampling eşiği
         """
         self.eval()
+        past_kvs = None
 
-        for _ in range(max_new_tokens):
-            # Sequence uzunluğunu max_seq_len ile sınırla
-            idx_cond = input_ids[:, -self.config.max_seq_len:]
+        for step in range(max_new_tokens):
+            if past_kvs is None:
+                # Prefill: tüm prompt'u işle
+                idx_input = input_ids
+            else:
+                # Decode: sadece son token
+                idx_input = input_ids[:, -1:]
 
             # Forward pass
-            logits, _ = self(idx_cond)
+            logits, _, past_kvs = self(idx_input, past_kvs=past_kvs)
             logits = logits[:, -1, :] / temperature  # Son token'ın logit'leri
 
             # Top-k filtering
@@ -177,7 +251,6 @@ class ToprakLM(nn.Module):
                 cumulative_probs = torch.cumsum(
                     F.softmax(sorted_logits, dim=-1), dim=-1
                 )
-                # Kümülatif olasılık top_p'yi aşan token'ları kaldır
                 sorted_indices_to_remove = cumulative_probs > top_p
                 sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
                 sorted_indices_to_remove[:, 0] = False

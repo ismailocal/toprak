@@ -20,6 +20,8 @@ lxml>=4.9.0
 langdetect>=1.0.9
 tqdm>=4.65.0
 numpy>=1.24.0
+tensorboard>=2.14.0
+setuptools>=69.0.0,<82        # Python 3.14+ (TensorBoard pkg_resources bağımlılığı)
 
 # Apple Silicon
 mlx>=0.1.0

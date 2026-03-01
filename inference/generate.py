@@ -1,6 +1,7 @@
 """
 Toprak — Metin Üretimi
 Top-k, top-p, temperature sampling ile autoregressive text generation.
+KV Cache destekli hızlı inference.
 """
 
 import sys
@@ -9,10 +10,12 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
+import torch.nn.functional as F
 
-from model.config import ModelConfig, TOPRAK_SMALL
+from model.config import ModelConfig, TOPRAK_SMALL, detect_device
 from model.transformer import ToprakLM
 from model.tokenizer import ToprakTokenizer
+from utils.validation import validate_checkpoint, validate_tokenizer, setup_error_handler
 
 
 def generate_text(
@@ -34,13 +37,21 @@ def generate_text(
     generated = list(input_ids)
     input_tensor = torch.tensor([input_ids], dtype=torch.long).to(device)
 
-    with torch.no_grad():
-        for _ in range(max_new_tokens):
-            # Context window sınırı
-            context = input_tensor[:, -512:]
+    past_kvs = None
 
-            output = model(context)
-            logits = (output[0] if isinstance(output, tuple) else output)[:, -1, :]
+    with torch.no_grad():
+        for step in range(max_new_tokens):
+            if past_kvs is None:
+                # Prefill: tüm prompt'u işle
+                idx_input = input_tensor
+            else:
+                # Decode: sadece son token
+                idx_input = input_tensor[:, -1:]
+
+            # Forward pass — KV cache ile
+            output = model(idx_input, past_kvs=past_kvs)
+            logits, _, past_kvs = output
+            logits = logits[:, -1, :]
 
             # Repetition penalty uygula
             if repetition_penalty != 1.0:
@@ -122,6 +133,7 @@ def load_model(
 
 
 def main():
+    setup_error_handler()
     import argparse
 
     parser = argparse.ArgumentParser(description="🌱 Toprak — Metin Üretimi")
@@ -136,17 +148,24 @@ def main():
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--top-k", type=int, default=50)
     parser.add_argument("--top-p", type=float, default=0.9)
-    parser.add_argument("--device", type=str, default="mps")
+    parser.add_argument("--device", type=str, default=None,
+                        help="Cihaz (varsayılan: otomatik)")
     parser.add_argument("--num-samples", type=int, default=1,
                         help="Kaç farklı çıktı üretilecek")
 
     args = parser.parse_args()
 
+    # Dosya kontrolleri
+    validate_checkpoint(args.checkpoint)
+    validate_tokenizer(args.tokenizer)
+
+    device = args.device or detect_device()
+
     print("🌱 Toprak — Metin Üretimi")
     print("=" * 50)
 
     # Model yükle
-    model, config = load_model(args.checkpoint, args.device)
+    model, config = load_model(args.checkpoint, device)
     tokenizer = ToprakTokenizer(args.tokenizer)
 
     print(f"  Model: {model.count_parameters()/1e6:.1f}M parametre")
@@ -167,7 +186,7 @@ def main():
             temperature=args.temperature,
             top_k=args.top_k,
             top_p=args.top_p,
-            device=args.device,
+            device=device,
         )
         print(f"\n{text}")
 

@@ -1,10 +1,6 @@
-"""
-Toprak — PyTorch Dataset
-Tokenize edilmiş Türkçe metin verisi için Dataset ve DataLoader.
-"""
-
 import json
 import os
+import random
 from typing import List, Optional
 
 import torch
@@ -17,6 +13,11 @@ class ToprakDataset(Dataset):
 
     Tokenize edilmiş veriyi sabit uzunluklu bloklara böler
     ve (input, target) çiftleri olarak sunar.
+
+    Döküman seviyesinde karıştırma desteği:
+    - Metinler önce döküman olarak yüklenir
+    - Karıştırılır (shuffle)
+    - Ardından tek token dizisine birleştirilir
     """
 
     def __init__(
@@ -25,6 +26,8 @@ class ToprakDataset(Dataset):
         tokenizer,
         max_seq_len: int = 512,
         split: str = "train",
+        shuffle_docs: bool = True,
+        seed: int = 42,
     ):
         """
         Args:
@@ -32,6 +35,8 @@ class ToprakDataset(Dataset):
             tokenizer: ToprakTokenizer instance
             max_seq_len: Maksimum sequence uzunluğu
             split: 'train' veya 'eval'
+            shuffle_docs: Dökümanları karıştır (train için önerilir)
+            seed: Rastgelelik seed'i
         """
         self.tokenizer = tokenizer
         self.max_seq_len = max_seq_len
@@ -39,15 +44,15 @@ class ToprakDataset(Dataset):
 
         # Tüm metinleri yükle ve tokenize et
         print(f"Veri yükleniyor ({split})...")
-        self.tokens = self._load_and_tokenize(data_dir)
+        self.tokens = self._load_and_tokenize(data_dir, shuffle_docs, seed)
         print(f"  Toplam token: {len(self.tokens):,}")
         print(f"  Toplam blok: {len(self):,}")
 
-    def _load_and_tokenize(self, data_dir: str) -> List[int]:
-        """Tüm metinleri yükle ve tokenize et."""
-        all_tokens = []
+    def _load_and_tokenize(self, data_dir: str, shuffle_docs: bool, seed: int) -> List[int]:
+        """Tüm metinleri yükle, karıştır ve tokenize et."""
+        # 1. Dökümanları ayrı ayrı yükle
+        documents = []
 
-        # Hem .jsonl hem .txt dosyalarını destekle
         for filename in sorted(os.listdir(data_dir)):
             filepath = os.path.join(data_dir, filename)
 
@@ -58,10 +63,7 @@ class ToprakDataset(Dataset):
                             doc = json.loads(line)
                             text = doc.get("text", "")
                             if text:
-                                tokens = self.tokenizer.encode(
-                                    text, add_bos=True, add_eos=True
-                                )
-                                all_tokens.extend(tokens)
+                                documents.append(text)
                         except json.JSONDecodeError:
                             continue
 
@@ -70,10 +72,21 @@ class ToprakDataset(Dataset):
                     for line in f:
                         text = line.strip()
                         if text:
-                            tokens = self.tokenizer.encode(
-                                text, add_bos=True, add_eos=True
-                            )
-                            all_tokens.extend(tokens)
+                            documents.append(text)
+
+        print(f"  Döküman sayısı: {len(documents):,}")
+
+        # 2. Dökümanları karıştır
+        if shuffle_docs:
+            rng = random.Random(seed)
+            rng.shuffle(documents)
+            print(f"  ✓ Dökümanlar karıştırıldı (seed={seed})")
+
+        # 3. Tokenize et ve birleştir
+        all_tokens = []
+        for text in documents:
+            tokens = self.tokenizer.encode(text, add_bos=True, add_eos=True)
+            all_tokens.extend(tokens)
 
         return all_tokens
 

@@ -25,10 +25,13 @@ class ToprakConfig(PretrainedConfig):
         vocab_size=32000,
         d_model=512,
         num_heads=8,
+        num_kv_heads=2,
         num_layers=12,
         d_ff=2048,
         max_seq_len=512,
-        dropout=0.1,
+        dropout=0.0,
+        rope_theta=10000.0,
+        norm_eps=1e-6,
         pad_token_id=0,
         bos_token_id=2,
         eos_token_id=3,
@@ -37,10 +40,13 @@ class ToprakConfig(PretrainedConfig):
         self.vocab_size = vocab_size
         self.d_model = d_model
         self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
         self.num_layers = num_layers
         self.d_ff = d_ff
         self.max_seq_len = max_seq_len
         self.dropout = dropout
+        self.rope_theta = rope_theta
+        self.norm_eps = norm_eps
 
         super().__init__(
             pad_token_id=pad_token_id,
@@ -55,10 +61,13 @@ class ToprakConfig(PretrainedConfig):
             vocab_size=self.vocab_size,
             d_model=self.d_model,
             num_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
             num_layers=self.num_layers,
             d_ff=self.d_ff,
             max_seq_len=self.max_seq_len,
             dropout=self.dropout,
+            rope_theta=self.rope_theta,
+            norm_eps=self.norm_eps,
             pad_token_id=self.pad_token_id,
             bos_token_id=self.bos_token_id,
             eos_token_id=self.eos_token_id,
@@ -76,7 +85,7 @@ class ToprakForCausalLM(PreTrainedModel):
         self.model = ToprakLM(model_config)
 
     def forward(self, input_ids, labels=None, **kwargs):
-        logits, loss = self.model(input_ids, targets=labels)
+        logits, loss, _ = self.model(input_ids, targets=labels)
 
         # HuggingFace formatına uygun output
         from transformers.modeling_outputs import CausalLMOutput

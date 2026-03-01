@@ -36,64 +36,75 @@ Dünya genelinde yüzlerce dil modeli geliştirilirken, **Türkçe için sıfır
 
 > **💡 Bu bir ticari ürün değil, bir araştırma ve milli katkı projesidir.** Türkiye'de yapay zeka alanında bağımsız üretim kapasitesini geliştirmek için atılmış bir adımdır.
 
+> 📖 **Kapsamlı kullanım rehberi için:** [GUIDE.md](GUIDE.md) — Kurulum, eğitim, inference, parametreler ve sık sorulan sorular.
+
 ---
 
 ## Hızlı Bakış
 
 | | Detay |
 |---|---|
-| **Mimari** | Decoder-only Transformer (GPT-2 tarzı, Pre-LayerNorm) |
-| **Küçük Model** | ~85M parametre — `d_model=640`, `layers=14`, `heads=10` |
-| **Orta Model** | ~125M parametre — `d_model=768`, `layers=16`, `heads=12` |
+| **Mimari** | Decoder-only Transformer (LLaMA tarzı, 2024 nesil) |
+| **Small** | ~80M parametre — `d_model=640`, `layers=14`, `heads=10`, `kv_heads=2` |
+| **Medium** | ~125M parametre — `d_model=768`, `layers=16`, `heads=12`, `kv_heads=4` |
+| **Large** | ~342M parametre — `d_model=1024`, `layers=28`, `heads=16`, `kv_heads=4` |
+| **XL** | ~941M parametre — `d_model=1536`, `layers=36`, `heads=16`, `kv_heads=4` |
+| **Normalizasyon** | RMSNorm (bias'sız, LayerNorm'dan daha hızlı) |
+| **Aktivasyon** | SwiGLU (gated FFN, SiLU tabanlı) |
+| **Pozisyon** | RoPE (Rotary Position Embedding) |
+| **Attention** | GQA (Grouped Query Attention) + KV Cache + SDPA |
 | **Tokenizer** | 32K BPE (SentencePiece, Türkçe morfolojisine uygun) |
 | **Eğitim Verisi** | Türkçe Wikipedia + haber siteleri + kamu kaynakları |
-| **Cihaz** | Apple M4 Pro — 24GB RAM, MPS (Metal GPU) |
-| **Framework** | PyTorch 2.x |
-| **Aktivasyon** | GELU |
+| **Cihaz** | Auto-detect: CUDA (NVIDIA) / MPS (Apple Silicon) / CPU |
+| **Framework** | PyTorch 2.x + torch.compile() |
 | **Optimizer** | AdamW (weight decay=0.1, betas=0.9/0.95) |
 | **LR Scheduler** | Cosine annealing with linear warmup |
-| **Precision** | bfloat16 mixed precision |
+| **Precision** | MPS: bfloat16 / CUDA: float16 mixed precision |
 
 ---
 
 ## Mimari
 
 ```
-┌────────────────────────────────────────────────────────┐
-│                  ToprakLM                              │
-│                                                        │
-│  Input IDs ──► Token Embedding ──┐                     │
-│                                  ├──► + ──► Dropout    │
-│  Positions ──► Position Embedding┘                     │
-│                      │                                 │
-│              ┌───────▼─────────────────┐               │
-│              │ TransformerBlock × N    │               │
-│              │                         │               │
-│              │  ┌────────────┐         │               │
-│              │  │ LayerNorm  │         │               │
-│              │  │ Multi-Head │         │               │
-│              │  │ Attention  │         │  Pre-LN       │
-│              │  │ + Residual │         │  Architecture │
-│              │  ├────────────┤         │               │
-│              │  │ LayerNorm  │         │               │
-│              │  │ FFN (GELU) │         │               │
-│              │  │ + Residual │         │               │
-│              │  └────────────┘         │               │
-│              └───────┬─────────────────┘               │
-│                      │                                 │
-│              ┌───────▼────────┐                        │
-│              │  Final LN      │                        │
-│              │  LM Head       │◄── Weight Tying        │
-│              └───────┬────────┘                        │
-│                      │                                 │
-│                   Logits                               │
-└────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────┐
+│                  ToprakLM (2024)                        │
+│                                                         │
+│  Input IDs ──► Token Embedding                          │
+│                      │         (Positional Emb yok,     │
+│                      │          RoPE kullanılıyor)      │
+│              ┌───────▼──────────────────┐               │
+│              │  TransformerBlock × N    │               │
+│              │                          │               │
+│              │  ┌─────────────┐         │               │
+│              │  │ RMSNorm     │         │               │
+│              │  │ GQA + RoPE  │         │  Pre-RMSNorm  │
+│              │  │ + KV Cache  │         │  Architecture │
+│              │  │ + Residual  │         │               │
+│              │  ├─────────────┤         │               │
+│              │  │ RMSNorm     │         │               │
+│              │  │ SwiGLU FFN  │         │               │
+│              │  │ + Residual  │         │               │
+│              │  └─────────────┘         │               │
+│              └───────┬──────────────────┘               │
+│                      │                                  │
+│              ┌───────▼────────┐                         │
+│              │  RMSNorm       │                         │
+│              │  LM Head       │◄── Weight Tying         │
+│              └───────┬────────┘                         │
+│                      │                                  │
+│                   Logits                                │
+└─────────────────────────────────────────────────────────┘
 ```
 
-**Temel tasarım kararları:**
-- **Pre-LayerNorm**: Eğitim stabilitesi için (Post-LN'ye göre çok daha kararlı)
-- **Weight Tying**: Token embedding ile LM head aynı ağırlıkları paylaşır → parametre tasarrufu
-- **Causal Masking**: Üst üçgen mask ile autoregressive üretim
+**Temel tasarım kararları (LLaMA/Mistral/Gemma tarzı):**
+- **RMSNorm**: Bias'sız, LayerNorm'dan ~%5-8 daha hızlı normalizasyon
+- **SwiGLU**: 3 katmanlı gated FFN (SiLU aktivasyonlu), GELU'dan daha düşük loss
+- **RoPE**: Rotary Position Embedding — relative position, extrapolation kabiliyeti
+- **GQA**: Grouped Query Attention — daha az KV head ile bellek tasarrufu
+- **KV Cache**: Inference'da sadece son token hesaplanır → 5-10x hız artışı
+- **Bias-free**: Tüm Linear katmanlardan bias kaldırıldı
+- **Weight Tying**: Token embedding ile LM head aynı ağırlıkları paylaşır
+- **Causal Masking**: Dinamik üst üçgen mask ile autoregressive üretim
 - **Gradient Accumulation**: Küçük batch'lerle büyük efektif batch simülasyonu
 
 ---
@@ -104,9 +115,11 @@ Dünya genelinde yüzlerce dil modeli geliştirilirken, **Türkçe için sıfır
 toprak/
 │
 ├── model/                        # Model Mimarisi
-│   ├── config.py                 #    Model konfigürasyonları (Small / Medium)
-│   ├── attention.py              #    Multi-Head Self-Attention + Causal Mask
-│   ├── transformer.py            #    ToprakLM — Ana model sınıfı
+│   ├── config.py                 #    Model konfigürasyonları (Small/Medium/Large/XL)
+│   ├── attention.py              #    GQA + RoPE + KV Cache + SDPA
+│   ├── transformer.py            #    ToprakLM (SwiGLU, RMSNorm, Grad Checkpoint)
+│   ├── norms.py                  #    RMSNorm — Modern normalizasyon
+│   ├── rope.py                   #    RoPE — Rotary Position Embedding
 │   └── tokenizer.py              #    SentencePiece BPE Tokenizer wrapper
 │
 ├── data/                         # Veri Toplama & İşleme
@@ -340,6 +353,21 @@ Bu proje Türk yapay zeka topluluğuna açıktır. Katkıda bulunmak isterseniz:
 ## Teknik Detaylar
 
 <details>
+<summary><strong>Model Mimarisi (2024 Nesil)</strong></summary>
+
+- **RMSNorm**: Bias'sız root mean square normalizasyon (LayerNorm yerine)
+- **SwiGLU**: 3 katmanlı gated FFN — `SiLU(gate) * up → down` (GELU yerine)
+- **RoPE**: Rotary Position Embedding — complex çarpımla pozisyon kodlama
+- **GQA**: Grouped Query Attention — 10Q/2KV (small), 12Q/4KV (medium), 16Q/4KV (large/xl)
+- **SDPA**: PyTorch native scaled_dot_product_attention (FlashAttention benzeri)
+- **KV Cache**: Inference'da geçmiş key/value'ları sakla → her adımda sadece 1 token
+- **Bias-free**: Tüm Linear katmanlardan bias kaldırıldı
+- **Weight Tying**: Token embedding ↔ LM head aynı ağırlıklar
+- **Init**: GPT-NeoX tarzı — residual projeksiyonlar `1/√(2N)` ile scaled
+
+</details>
+
+<details>
 <summary><strong>Veri Pipeline</strong></summary>
 
 - **Crawler**: asyncio + aiohttp, robots.txt uyumlu, 1s rate limit
@@ -362,19 +390,26 @@ Bu proje Türk yapay zeka topluluğuna açıktır. Katkıda bulunmak isterseniz:
 </details>
 
 <details>
-<summary><strong>Eğitim Optimizasyonları (Apple Silicon)</strong></summary>
+<summary><strong>Eğitim Optimizasyonları</strong></summary>
 
-- **MPS Backend**: `device='mps'` — Apple Metal Performance Shaders
-- **Mixed Precision**: `torch.autocast(device_type='mps', dtype=torch.bfloat16)`
+- **Multi-Device**: CUDA (NVIDIA) / MPS (Apple Silicon) / CPU — otomatik algılama
+- **SDPA**: PyTorch native scaled_dot_product_attention
+- **torch.compile()**: Model derleme ile %10-30 hız artışı
+- **Gradient Checkpointing**: FFN katmanlarında bellek tasarrufu
+- **Mixed Precision**: MPS (bfloat16) / CUDA (float16)
 - **Gradient Accumulation**: Küçük batch ile büyük efektif batch simülasyonu
-- **Gradient Clipping**: Max norm 0.5
+- **Gradient Clipping**: Max norm 1.0
 - **Checkpoint Strategy**: Her 5000 adımda kaydet, son 3'ü tut
+- **TensorBoard**: Loss, LR, tokens/s, grad norm, eval perplexity takibi
+- **Döküman Karıştırma**: Epoch başı döküman seviyesinde shuffle
+- **Dropout**: 0.0 (modern modellerde dropout kullanılmıyor)
 
 </details>
 
 <details>
 <summary><strong>Inference</strong></summary>
 
+- **KV Cache**: Prefill + decode ayrılmış — her adımda sadece son token hesaplanır
 - **Top-k Sampling**: En olası k token arasından seçim
 - **Top-p (Nucleus) Sampling**: Kümülatif olasılık eşiği
 - **Repetition Penalty**: Tekrar eden tokenlere ceza (×1.3)

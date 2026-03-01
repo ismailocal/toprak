@@ -10,10 +10,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 
-from model.config import ModelConfig, TOPRAK_SMALL
+from model.config import ModelConfig, TOPRAK_SMALL, detect_device
 from model.transformer import ToprakLM
 from model.tokenizer import ToprakTokenizer
 from inference.generate import load_model, generate_text
+from utils.validation import validate_checkpoint, validate_tokenizer, setup_error_handler
 
 
 def chat(
@@ -120,6 +121,7 @@ def chat(
 
 
 def main():
+    setup_error_handler()
     import argparse
 
     parser = argparse.ArgumentParser(description="🌱 Toprak — Sohbet Arayüzü")
@@ -127,7 +129,8 @@ def main():
                         help="Model checkpoint dosyası")
     parser.add_argument("--tokenizer", type=str, default="toprak_tokenizer.model",
                         help="Tokenizer model dosyası")
-    parser.add_argument("--device", type=str, default="mps")
+    parser.add_argument("--device", type=str, default=None,
+                        help="Cihaz (varsayılan: otomatik)")
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--top-k", type=int, default=50)
     parser.add_argument("--top-p", type=float, default=0.9)
@@ -137,24 +140,30 @@ def main():
 
     args = parser.parse_args()
 
+    # Dosya kontrolleri
+    validate_checkpoint(args.checkpoint)
+    validate_tokenizer(args.tokenizer)
+
+    device = args.device or detect_device()
+
     # Model yükle
     print("Model yükleniyor...")
-    model, config = load_model(args.checkpoint, args.device)
+    model, config = load_model(args.checkpoint, device)
     tokenizer = ToprakTokenizer(args.tokenizer)
     print(f"✓ Model hazır: {model.count_parameters()/1e6:.1f}M parametre")
 
     # Sohbet başlat
     chat(
-    model=model,
-    tokenizer=tokenizer,
-    device=args.device,
-    max_new_tokens=args.max_tokens,
-    temperature=args.temperature,
-    top_k=args.top_k,
-    top_p=args.top_p,
-    repetition_penalty=args.repetition_penalty,
-    no_repeat_ngram_size=args.no_repeat_ngram,
-)
+        model=model,
+        tokenizer=tokenizer,
+        device=device,
+        max_new_tokens=args.max_tokens,
+        temperature=args.temperature,
+        top_k=args.top_k,
+        top_p=args.top_p,
+        repetition_penalty=args.repetition_penalty,
+        no_repeat_ngram_size=args.no_repeat_ngram,
+    )
 
 
 if __name__ == "__main__":

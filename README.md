@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <em>"Toprak" — hem bir bebeğin adı, hem de tohumların yeşerdiği yer.<br>Bu proje, Türk milletinin kendi dilinde kendi yapay zekâsını yetiştirmesi için atılmış bir tohumdur.</em>
+  <em>"Toprak" — hem bir bebeğin adı, hem de tohumların yeşerdiği yer.<br>Bu proje, Türk milletinin kendi dilinde kendi yapay zekasını yetiştirmesi için atılmış bir tohumdur.</em>
 </p>
 
 <p align="center">
@@ -34,7 +34,7 @@ Dünya genelinde yüzlerce dil modeli geliştirilirken, **Türkçe için sıfır
 - 🍎 **Apple Silicon optimizasyonu** — M4 Pro / MPS (Metal GPU) üzerinde bfloat16 mixed precision ile eğitim.
 - 📖 **Tamamen açık kaynak** — Kod, mimari, eğitim süreci — her şey şeffaf ve erişilebilir.
 
-> **💡 Bu bir ticari ürün değil, bir araştırma ve milli katkı projesidir.** Türkiye'de yapay zekâ alanında bağımsız üretim kapasitesini geliştirmek için atılmış bir adımdır.
+> **💡 Bu bir ticari ürün değil, bir araştırma ve milli katkı projesidir.** Türkiye'de yapay zeka alanında bağımsız üretim kapasitesini geliştirmek için atılmış bir adımdır.
 
 ---
 
@@ -59,35 +59,35 @@ Dünya genelinde yüzlerce dil modeli geliştirilirken, **Türkçe için sıfır
 ## 🏛️ Mimari
 
 ```
-┌───────────────────────────────────────────-──────┐
-│                  ToprakLM                        │
-│                                                  │
-│  Input IDs ──► Token Embedding ──┐               │
-│                                  ├──► + ──► Dropout
-│  Positions ──► Position Embedding┘               │
-│                      │                           │
-│              ┌───────▼────────┐                  │
-│              │ TransformerBlock│ × N             │
-│              │                 │                 │
-│              │  ┌──────────┐   │                 │
-│              │  │ LayerNorm │  │                 │
-│              │  │ Multi-Head│  │                 │
-│              │  │ Attention │  │  Pre-LN         │
-│              │  │ + Residual│  │  Architecture   │
-│              │  ├──────────┤   │                 │
-│              │  │ LayerNorm │  │                 │
-│              │  │ FFN (GELU)│  │                 │
-│              │  │ + Residual│  │                 │
-│              │  └──────────┘   │                 │
-│              └───────┬───────-─┘                 │
-│                      │                           │
-│              ┌───────▼────────┐                  │
-│              │  Final LN      │                  │
-│              │  LM Head       │◄── Weight Tying  │
-│              └───────┬────────┘                  │
-│                      │                           │
-│                   Logits                         │
-└──────────────────────────────────────────────-───┘
+┌────────────────────────────────────────────────────────┐
+│                  ToprakLM                              │
+│                                                        │
+│  Input IDs ──► Token Embedding ──┐                     │
+│                                  ├──► + ──► Dropout    │
+│  Positions ──► Position Embedding┘                     │
+│                      │                                 │
+│              ┌───────▼─────────────────┐               │
+│              │ TransformerBlock × N    │               │
+│              │                         │               │
+│              │  ┌────────────┐         │               │
+│              │  │ LayerNorm  │         │               │
+│              │  │ Multi-Head │         │               │
+│              │  │ Attention  │         │  Pre-LN       │
+│              │  │ + Residual │         │  Architecture │
+│              │  ├────────────┤         │               │
+│              │  │ LayerNorm  │         │               │
+│              │  │ FFN (GELU) │         │               │
+│              │  │ + Residual │         │               │
+│              │  └────────────┘         │               │
+│              └───────┬─────────────────┘               │
+│                      │                                 │
+│              ┌───────▼────────┐                        │
+│              │  Final LN      │                        │
+│              │  LM Head       │◄── Weight Tying        │
+│              └───────┬────────┘                        │
+│                      │                                 │
+│                   Logits                               │
+└────────────────────────────────────────────────────────┘
 ```
 
 **Temel tasarım kararları:**
@@ -246,7 +246,7 @@ python3 inference/chat.py \
 python3 inference/generate.py \
   --checkpoint checkpoints/toprak_best.pt \
   --tokenizer toprak_tokenizer.model \
-  --prompt "Yapay zekânın geleceği" \
+  --prompt "Yapay zekanın geleceği" \
   --temperature 0.8 \
   --num-samples 3
 ```
@@ -320,7 +320,7 @@ python3 upload/push_to_hub.py --checkpoint checkpoints/toprak_best.pt \
 
 ## 🤝 Katkı
 
-Bu proje Türk yapay zekâ topluluğuna açıktır. Katkıda bulunmak isterseniz:
+Bu proje Türk yapay zeka topluluğuna açıktır. Katkıda bulunmak isterseniz:
 
 1. Bu repoyu **fork**'layın
 2. Feature branch oluşturun (`git checkout -b feature/yeni-ozellik`)
@@ -407,7 +407,7 @@ Bu proje [MIT Lisansı](LICENSE) altında yayınlanmıştır. Herkes özgürce k
 
 <p align="center">
   <strong>🌱 Her büyük ağaç, küçük bir tohumla başlar.</strong><br>
-  <em>Toprak — Türk milletinin yapay zekâ toprağı.</em>
+  <em>Toprak — Türk milletinin yapay zeka toprağı.</em>
 </p>
 
 <p align="center">
